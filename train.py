@@ -2,6 +2,36 @@
 Autoresearch pretraining script. Single-GPU, single-file.
 Cherry-picked and simplified from nanochat.
 Usage: uv run train.py
+
+NEW: Semantic Weighted Training & Full-Duplex Speech Model Support
+===================================================================
+
+This version includes two major enhancements for speech model training:
+
+1. SEMANTIC WEIGHTED TRAINING
+   - Weights training loss by token importance (content words > function words)
+   - Uses inverse frequency heuristic: rare tokens = higher weight
+   - Controlled by USE_SEMANTIC_WEIGHTING and SEMANTIC_WEIGHT_STRENGTH
+   - Benefits: Faster convergence on important semantic content
+   - For speech: Prioritizes content-bearing phonemes/words over fillers
+
+2. FULL-DUPLEX ARCHITECTURE SUPPORT
+   - Enables bidirectional (non-causal) attention in early layers
+   - Simulates simultaneous listening & speaking (full-duplex communication)
+   - Controlled by BIDIRECTIONAL_LAYERS parameter (0 = standard causal)
+   - Early layers can attend to future context (like a speech recognizer)
+   - Later layers remain causal (for generation)
+   - Benefits: Better understanding of context for speech turn-taking
+
+Configuration:
+- Set USE_SEMANTIC_WEIGHTING=True to enable semantic weighting
+- Set SEMANTIC_WEIGHT_STRENGTH=1.0 for full weighting (0.0 = disabled)
+- Set BIDIRECTIONAL_LAYERS=2 to make first 2 layers bidirectional
+
+Example for speech models:
+- BIDIRECTIONAL_LAYERS=2-3 (early layers understand full context)
+- USE_SEMANTIC_WEIGHTING=True (focus on content, not filler)
+- SEMANTIC_WEIGHT_STRENGTH=0.7-1.0 (adjustable importance)
 """
 
 import os
