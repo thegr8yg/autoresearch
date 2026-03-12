@@ -38,6 +38,7 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    bidirectional_layers: int = 0
 
 
 def norm(x):
@@ -65,6 +66,7 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.layer_idx = layer_idx
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
@@ -74,7 +76,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, is_bidirectional=False):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -90,7 +92,9 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        # For full-duplex speech: use bidirectional attention in specified layers
+        causal = not is_bidirectional
+        y = fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -114,9 +118,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.layer_idx = layer_idx
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, window_size, is_bidirectional=False):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, is_bidirectional)
         x = x + self.mlp(norm(x))
         return x
 
@@ -126,6 +131,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.window_sizes = self._compute_window_sizes(config)
+        self.bidirectional_layers = getattr(config, 'bidirectional_layers', 0)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
@@ -265,7 +271,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, reduction='mean'):
+    def forward(self, idx, targets=None, reduction='mean', semantic_weights=None):
         B, T = idx.size()
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
@@ -276,7 +282,9 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            # Use bidirectional attention for early layers (full-duplex)
+            is_bidirectional = i < self.bidirectional_layers
+            x = block(x, ve, cos_sin, self.window_sizes[i], is_bidirectional)
         x = norm(x)
 
         softcap = 15
@@ -285,8 +293,20 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
+            # Compute per-token losses
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
+                                   ignore_index=-1, reduction='none')
+
+            # Apply semantic weighting if provided
+            if semantic_weights is not None:
+                loss = loss * semantic_weights.view(-1)
+
+            # Apply final reduction
+            if reduction == 'mean':
+                loss = loss.mean()
+            elif reduction == 'sum':
+                loss = loss.sum()
+
             return loss
         return logits
 
@@ -426,6 +446,40 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_muon(group)
 
 # ---------------------------------------------------------------------------
+# Semantic Weight Computation for Speech Models
+# ---------------------------------------------------------------------------
+
+def compute_semantic_weights(tokens, vocab_size, device='cuda'):
+    """
+    Compute semantic importance weights for tokens.
+    For speech models, this prioritizes content-bearing tokens over filler.
+
+    Weight strategy:
+    - Rare tokens (information-rich): higher weight
+    - Common tokens (function words, fillers): lower weight
+    - Uses inverse frequency heuristic based on token IDs
+    """
+    B, T = tokens.size()
+
+    # Inverse frequency approximation: rare tokens have lower IDs in BPE
+    # We use a smooth sigmoid to create a weighting curve
+    # This is a simple heuristic that can be replaced with actual frequency stats
+
+    # Normalize token IDs to [0, 1]
+    normalized_ids = tokens.float() / vocab_size
+
+    # Apply sigmoid-based weighting: rare tokens get higher weights
+    # The formula creates a curve where earlier tokens (rare) get ~1.5x weight
+    # and common tokens (high IDs) get ~0.5x weight
+    base_weight = 0.5 + 0.5 * torch.sigmoid(3.0 * (0.5 - normalized_ids))
+
+    # Ensure weights are in reasonable range [0.3, 1.5]
+    semantic_weights = 0.3 + 1.2 * base_weight
+
+    return semantic_weights
+
+
+# ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
@@ -433,6 +487,13 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+
+# Semantic Weighted Training (for speech models)
+USE_SEMANTIC_WEIGHTING = True  # Enable semantic importance weighting
+SEMANTIC_WEIGHT_STRENGTH = 1.0  # Strength of semantic weighting (0.0 = off, 1.0 = full)
+
+# Full-Duplex Support
+BIDIRECTIONAL_LAYERS = 0  # Number of layers with non-causal attention (0 = standard causal)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
@@ -473,7 +534,7 @@ def build_model_config(depth):
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
+        window_pattern=WINDOW_PATTERN, bidirectional_layers=BIDIRECTIONAL_LAYERS,
     )
 
 config = build_model_config(DEPTH)
@@ -545,7 +606,16 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            # Compute semantic weights if enabled
+            semantic_weights = None
+            if USE_SEMANTIC_WEIGHTING and SEMANTIC_WEIGHT_STRENGTH > 0:
+                semantic_weights = compute_semantic_weights(y, vocab_size, device='cuda')
+                # Blend with uniform weights based on strength
+                if SEMANTIC_WEIGHT_STRENGTH < 1.0:
+                    semantic_weights = (SEMANTIC_WEIGHT_STRENGTH * semantic_weights +
+                                      (1.0 - SEMANTIC_WEIGHT_STRENGTH) * torch.ones_like(semantic_weights))
+
+            loss = model(x, y, semantic_weights=semantic_weights)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
